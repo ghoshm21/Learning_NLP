@@ -24,10 +24,7 @@ from gensim.models import KeyedVectors
 #cont = Contractions('/root/docker_data/lib/GoogleNews-vectors-negative300.bin')
 #cont.load_models()
 
-# load spacy model
-# nlp = spacy.load(r'/root/docker_data/lib/en_core_web_lg-2.3.1/en_core_web_lg/en_core_web_lg-2.3.1')
-nlp = spacy.load("en_core_web_sm")
-spell = SpellChecker()
+
 
 spark = SparkSession.builder \
         .getOrCreate()
@@ -40,6 +37,23 @@ from pyspark.sql.types import *
 import pyspark.sql.functions as func
 
 from pyspark.sql.functions import *
+#--------------------------------------------------------------------------------------#
+# load spacy model
+# nlp = spacy.load(r'/root/docker_data/lib/en_core_web_lg-2.3.1/en_core_web_lg/en_core_web_lg-2.3.1')
+# nlp = spacy.load("en_core_web_sm")
+spell = None
+nlp = None
+d = None
+chkr = None
+
+def get_spacy_model():
+    global nlp
+    global _model
+    if not nlp:
+       _model = spacy.load("en_core_web_lg")
+    nlp = _model
+    return nlp
+
 
 # all data processing functions and UDF
 def remove_html(input):
@@ -132,6 +146,7 @@ spark.udf.register("to_lower_udf", to_lower, StringType())
 #     # Remove any web url starting with http or www
 #     text = 'NULL' if text is None else re.sub(r'(www|http)\S+', '', text)
 #     return text
+#text = 'https://t.co/mtzeFmKmto'
 def remove_url(text):
     # Remove any web url starting with http or www
     text = 'NULL' if text is None else re.sub(r'(http|https|ftp|ssh|sftp|www)://([\w_-]+(?:(?:\.[\w_-]+)+))([\w.,@?^=%&:/~+#-]*[\w@?^=%&/~+#-])?', '' , text)
@@ -190,6 +205,7 @@ spark.udf.register("get_mention_udf", get_mention, StringType())
 def get_base_word(text):
     x = 'NULL' if text is None else str(text)
     x_list = []
+    nlp = get_spacy_model()
     doc = nlp(x)
     for token in doc:
         lemma = token.lemma_
@@ -216,6 +232,9 @@ spark.udf.register("correct_spell_textblob_udf", correct_spell_textblob, StringT
 # Exmp: x = 'GFG is a good company and always value their employed.'
 # GFG will converted to GIG
 def correct_spell_spellcheck(text):
+    global spell
+    if not spell:
+       spell = SpellChecker()
     text = 'NULL' if text is None else str(text)
     final = [spell.correction(word) for word in x.split()]
     return ' '.join(final)
@@ -229,17 +248,23 @@ spark.udf.register("correct_spell_spellcheck_udf", correct_spell_spellcheck, Str
 # https://stackoverflow.com/questions/31026394/how-to-correct-text-and-return-the-corrected-text-automatically-with-pyenchant#new-answer
 # need libenchant-dev C lib
 # apt-get install libenchant-dev
-# problem -  do not consider the context and try to match word by word.
+# problem -  this does not consider the context and try to match word by word.
 # try 'outrageous top experts used by cdc move total us coronavirus deaths from  million to  to  in only  days httpstcofoxcgaacj'
 # CDC will be CC and TextBlob will remove the CDC. This will chage the meaning of the line
 # Try not to use it
 import enchant, difflib
-d = enchant.Dict("en_US")
 from enchant.checker import SpellChecker
-chkr = SpellChecker("en_US")
+# d = enchant.Dict("en_US")
+# chkr = SpellChecker("en_US")
 # my_sent="This is sme sample txt with erors httpstcofoxcgaacj."
 
 def enchant_spellcheck(my_sent):
+    global d
+    global chkr
+    if not d:
+        d = enchant.Dict("en_US")
+    if not chkr:
+        chkr = SpellChecker("en_US")
     my_sent = 'NULL' if my_sent is None else str(my_sent)
     chkr.set_text(my_sent)
     for err in chkr:
@@ -261,7 +286,7 @@ enchant_spellcheck_udf = udf(lambda row: enchant_spellcheck(row), StringType())
 spark.udf.register("enchant_spellcheck_udf", enchant_spellcheck, StringType())
 
 # load the real data
-data = spark.read.json("/root/docker_data/*.json")
+data = spark.read.json("/root/docker_data/NLP/data/input/*.json")
 data = data.withColumn("is_it_a_retweet",when(substring('text',1,2) == 'RT', 'Y').otherwise('N'))
 # create the view for spark sql
 data.createOrReplaceTempView("data")
@@ -291,80 +316,105 @@ filter_data_pre_process.createOrReplaceTempView("filter_data_pre_process")
 
 # filter_data_pre_process = filter_data.withColumn("tweet",coalesce(filter_data.full_text,filter_data.quoted_status_text, filter_data.text)) 
 #filter_data_pre_process.repartition(200)
+
+# remove_special_characters_udf(
 pre_process_twitter_data = spark.sql("""select id, lang, created_at, source,
 user_id_str, user_name, user_location, user_description, tweet_text,
     get_hashtag_udf(tweet_text) as hashtag,
     get_mention_udf(tweet_text) as mention,
     get_email_address_udf(tweet_text) as emails,
-    remove_all_punctuation_udf(
-    to_lower_udf(
-    remove_email_address_udf(
-    remove_url_udf(
-    remove_special_characters_udf(
-    ascii_to_string_udf(
-    remove_digits_udf(
     remove_blanks_udf(
     remove_tabs_udf(
+    remove_all_punctuation_udf(
+    expand_contractions_udf(
+    to_lower_udf(
+    remove_email_address_udf(
+    ascii_to_string_udf(
+    remove_tabs_udf(
     remove_accented_chars_udf(
-    remove_html_udf(tweet_text)
+    remove_html_udf(
+    remove_url_udf(tweet_text)
     )))))))))) as clean_tweet_text
     from filter_data_pre_process""").where("clean_tweet_text is not null")
-pre_process_twitter_data.createOrReplaceTempView("pre_process_twitter_data")
+
+# pre_process_twitter_data = spark.sql("""select id, lang, created_at, source,
+# user_id_str, user_name, user_location, user_description, tweet_text,
+#     get_hashtag_udf(tweet_text) as hashtag,
+#     get_mention_udf(tweet_text) as mention,
+#     get_email_address_udf(tweet_text) as emails,
+#     remove_html_udf(remove_url_udf(tweet_text)) as clean_tweet_text
+#     from filter_data_pre_process""").where("clean_tweet_text is not null")   
+
+# pre_process_twitter_data.createOrReplaceTempView("pre_process_twitter_data")
+pre_process_twitter_data.where("id = 1319485519462543361").show(1,False)
+# get the lemma, base words, spell check will take time
+pre_process_twitter_data = pre_process_twitter_data.withColumn("clean_tweet_text_lemma", remove_blanks_udf(get_base_word_udf("clean_tweet_text")))
 # write to the filesystem
-pre_process_twitter_data.coalesce(16).write.format('json').save('/root/temp/clean_data')
+pre_process_twitter_data.write.format('json').save('/root/docker_data/NLP/data/output/pre_process_twitter_data_lemma')
 
-# read the clean tweet
-clean_tweet = spark.read.json("/root/temp/clean_data/*.json")
-clean_tweet.createOrReplaceTempView("clean_tweet")
-twitter_data_baseword = spark.sql("""select
-id,
-created_at,
-emails,
-hashtag,
-lang,
-mention,
-source,
-user_description,
-user_id_str,
-user_location,
-user_name,
-tweet_text,
-clean_tweet_text,
-get_base_word_udf(clean_tweet_text) as clean_tweet_text_lamma
-from clean_tweet
-""")
+# do spell check
+pre_process_twitter_data = pre_process_twitter_data.withColumn("enchant_spellcheck", enchant_spellcheck_udf("clean_tweet_text")) \
+                            .withColumn("textBlob_spellcheck", correct_spell_textblob_udf("clean_tweet_text"))
 
-twitter_data_baseword.write.format('json').save('/root/temp/twitter_data_baseword')
+# get the lemma, base words after applyting spell check
+pre_process_twitter_data = pre_process_twitter_data.withColumn("enchant_spellcheck_lemma", remove_blanks_udf(get_base_word_udf("enchant_spellcheck"))) \
+                            .withColumn("textBlob_spellcheck_lemma", remove_blanks_udf(get_base_word_udf("textBlob_spellcheck")))
 
-process_twitter_data.count()
+# save the data to json
+pre_process_twitter_data.write.format('json').save('/root/docker_data/NLP/data/output/pre_process_twitter_data_all_lemma')
 
-now = spark.read.json("/root/temp/clean_data/part-00000-f5bef4b9-a655-41a6-843d-d8f9772d561f-c000.json")
-now.createOrReplaceTempView("now")
+# # read the clean tweet
+# clean_tweet = spark.read.json("/root/temp/clean_data/*.json")
+# clean_tweet.createOrReplaceTempView("clean_tweet")
+# twitter_data_baseword = spark.sql("""select
+# id,
+# created_at,
+# emails,
+# hashtag,
+# lang,
+# mention,
+# source,
+# user_description,
+# user_id_str,
+# user_location,
+# user_name,
+# tweet_text,
+# clean_tweet_text,
+# get_base_word_udf(clean_tweet_text) as clean_tweet_text_lemma
+# from clean_tweet
+# """)
 
-new_process = spark.sql("""select id, lang, created_at, source,
-user_id_str, user_name, user_location, user_description, tweet_text,
-    hashtag,
-    mention,
-    emails,
-    get_base_word_udf(
-    correct_spell_textblob_udf(tweet_text)) as clean_tweet_text
-    from now""")
-new_process.write.format('json').save('/root/temp/clean_data_word')
+# twitter_data_baseword.write.format('json').save('/root/temp/twitter_data_baseword')
+
+# process_twitter_data.count()
+
+# now = spark.read.json("/root/temp/clean_data/part-00000-f5bef4b9-a655-41a6-843d-d8f9772d561f-c000.json")
+# now.createOrReplaceTempView("now")
+
+# new_process = spark.sql("""select id, lang, created_at, source,
+# user_id_str, user_name, user_location, user_description, tweet_text,
+#     hashtag,
+#     mention,
+#     emails,
+#     get_base_word_udf(
+#     correct_spell_textblob_udf(tweet_text)) as clean_tweet_text
+#     from now""")
+# new_process.write.format('json').save('/root/temp/clean_data_word')
 
 
 
 
-spark.sql("""select id, clean_tweet_text, 
-            enchant_spellcheck_udf(clean_tweet_text) as enchant_spellcheck,
-            correct_spell_textblob_udf(clean_tweet_text) as textBlob_spellcheck
-    from now""").show(2,False)
+# spark.sql("""select id, clean_tweet_text, 
+#             enchant_spellcheck_udf(clean_tweet_text) as enchant_spellcheck,
+#             correct_spell_textblob_udf(clean_tweet_text) as textBlob_spellcheck
+#     from now""").show(2,False)
 
 
-dict,max = {},0
-a = set(d.suggest(my_word))
-for b in a:
-   tmp = difflib.SequenceMatcher(None, my_word, b).ratio();
-   dict[tmp] = b
-   if tmp > max:
-      max = tmp
-print (dict[max])
+# dict,max = {},0
+# a = set(d.suggest(my_word))
+# for b in a:
+#    tmp = difflib.SequenceMatcher(None, my_word, b).ratio();
+#    dict[tmp] = b
+#    if tmp > max:
+#       max = tmp
+# print (dict[max])
